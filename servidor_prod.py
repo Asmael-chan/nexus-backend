@@ -6,6 +6,7 @@ from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 import os, json, tempfile, uuid, requests
+
 os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
 app = Flask(__name__)
@@ -16,6 +17,8 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
 GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
+# ───────── CONFIG ─────────
+
 def get_client_config():
     config_str = os.environ.get('GOOGLE_CREDENTIALS')
     if config_str:
@@ -23,193 +26,223 @@ def get_client_config():
     with open('credentials.json') as f:
         return json.load(f)
 
+
 def get_drive_service(token_json):
     creds = Credentials.from_authorized_user_info(json.loads(token_json), SCOPES)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
     return build('drive', 'v3', credentials=creds)
 
+
 def get_token():
     return request.headers.get('X-Drive-Token') or request.args.get('token')
 
-# ── HEALTH ──
+# ───────── HEALTH ─────────
 @app.route('/health')
 def health():
-    return jsonify({'status': 'NEXUS online', 'groq': bool(GROQ_API_KEY)})
+    return jsonify({'status': 'NEXUS GOD MODE', 'groq': bool(GROQ_API_KEY)})
 
-# ── CHAT ──
+# ───────── CHAT IA ─────────
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
         data = request.json
         messages = data.get('messages', [])
-        temperature = data.get('temperature', 0.85)
-        max_tokens = data.get('max_tokens', 1500)
-
-        if not GROQ_API_KEY:
-            return jsonify({'error': 'GROQ_API_KEY no configurada'}), 500
-
-        # Use fastest model by default, vision model if images present
-        has_images = any(
-            isinstance(m.get('content'), list) and
-            any(c.get('type') == 'image_url' for c in m['content'])
-            for m in messages
-        )
-
-        model = 'meta-llama/llama-4-maverick-17b-128e-instruct' if has_images else 'llama-3.3-70b-versatile'
 
         res = requests.post(GROQ_URL, headers={
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {GROQ_API_KEY}'
         }, json={
-            'model': model,
-            'messages': messages,
-            'max_tokens': max_tokens,
-            'temperature': temperature
-        }, timeout=30)
+            'model': 'llama-3.3-70b-versatile',
+            'messages': messages
+        })
 
         return jsonify(res.json()), res.status_code
 
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ── AUTH GOOGLE DRIVE ──
+# ───────── AUTH GOOGLE (FIX PKCE) ─────────
 @app.route('/auth/login')
 def auth_login():
     try:
         config = get_client_config()
-        redirect_uri = os.environ.get('REDIRECT_URI', 'https://nexus-backend-ykn2.onrender.com/auth/callback')
+        redirect_uri = os.environ.get('REDIRECT_URI')
+
         flow = Flow.from_client_config(config, scopes=SCOPES, redirect_uri=redirect_uri)
+
         auth_url, state = flow.authorization_url(
             access_type='offline',
             prompt='consent'
         )
-        # Store state in URL so frontend can pass it back
-        return jsonify({'auth_url': auth_url, 'state': state})
+
+        # 🔥 GUARDAR SESIÓN
+        session['state'] = state
+        session['code_verifier'] = flow.code_verifier
+
+        return jsonify({'auth_url': auth_url})
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/auth/callback')
 def auth_callback():
     try:
         import urllib.parse
+
         config = get_client_config()
-        redirect_uri = os.environ.get('REDIRECT_URI', 'https://nexus-backend-ykn2.onrender.com/auth/callback')
-        
-        # Get code and state from Google's redirect
-        code = request.args.get('code')
-        state = request.args.get('state')
-        
+        redirect_uri = os.environ.get('REDIRECT_URI')
+
         flow = Flow.from_client_config(
-            config, scopes=SCOPES,
+            config,
+            scopes=SCOPES,
             redirect_uri=redirect_uri,
-            state=state
+            state=session.get('state')
         )
-        
-        # Build the full authorization response URL
-        auth_response = request.url
-        if auth_response.startswith('http://'):
-            auth_response = 'https://' + auth_response[7:]
-        
-        flow.fetch_token(authorization_response=auth_response)
+
+        # 🔥 RESTAURAR PKCE
+        flow.code_verifier = session.get('code_verifier')
+
+        flow.fetch_token(authorization_response=request.url)
+
         creds = flow.credentials
         token_json = creds.to_json()
-        frontend = os.environ.get('FRONTEND_URL', 'https://asmael-chan.github.io/nexus-app')
-        return redirect(f"{frontend}?drive_token={urllib.parse.quote(token_json)}")
-    except Exception as e:
-        return f"<h2>Error: {str(e)}</h2><p>Intenta de nuevo</p><a href='javascript:history.back()'>Volver</a>", 500
 
-# ── DRIVE ──
+        frontend = os.environ.get('FRONTEND_URL')
+
+        return redirect(f"{frontend}?drive_token={urllib.parse.quote(token_json)}")
+
+    except Exception as e:
+        return f"<h2>Error: {str(e)}</h2>", 500
+
+# ───────── DRIVE ─────────
 @app.route('/drive/list')
 def list_files():
     try:
         token = get_token()
-        if not token: return jsonify({'error': 'No token'}), 401
-        folder_id = request.args.get('folder_id', 'root')
+        if not token:
+            return jsonify({'error': 'No token'}), 401
+
         service = get_drive_service(token)
         results = service.files().list(
-            q=f"'{folder_id}' in parents and trashed=false",
-            pageSize=50, orderBy="folder,name",
-            fields="files(id,name,mimeType,size,modifiedTime)"
+            q="trashed=false",
+            pageSize=50,
+            fields="files(id,name,mimeType,size)"
         ).execute()
+
         return jsonify({'files': results.get('files', [])})
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/drive/folders')
-def list_folders():
-    try:
-        token = get_token()
-        if not token: return jsonify({'error': 'No token'}), 401
-        folder_id = request.args.get('folder_id', 'root')
-        service = get_drive_service(token)
-        results = service.files().list(
-            q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-            pageSize=50, orderBy="name",
-            fields="files(id,name,mimeType)"
-        ).execute()
-        return jsonify({'folders': results.get('files', [])})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/drive/search')
-def search_files():
-    try:
-        token = get_token()
-        if not token: return jsonify({'error': 'No token'}), 401
-        query = request.args.get('q', '')
-        service = get_drive_service(token)
-        results = service.files().list(
-            q=f"name contains '{query}' and trashed=false",
-            pageSize=20, fields="files(id,name,mimeType,size,modifiedTime)"
-        ).execute()
-        return jsonify({'files': results.get('files', [])})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/drive/upload', methods=['POST'])
-def upload_file():
-    try:
-        token = get_token()
-        if not token: return jsonify({'error': 'No token'}), 401
-        if 'file' not in request.files:
-            return jsonify({'error': 'No se envió archivo'}), 400
-        file = request.files['file']
-        folder_id = request.form.get('folder_id', 'root')
-        temp_path = os.path.join(tempfile.gettempdir(), f"nexus_{uuid.uuid4()}_{file.filename}")
-        file.save(temp_path)
-        service = get_drive_service(token)
-        media = MediaFileUpload(temp_path, resumable=False)
-        uploaded = service.files().create(
-            body={'name': file.filename, 'parents': [folder_id]},
-            media_body=media, fields='id,name'
-        ).execute()
-        try: media._fd.close()
-        except: pass
-        os.remove(temp_path)
-        return jsonify({'success': True, 'file': uploaded})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
+# 📂 CREAR CARPETA
 @app.route('/drive/folder', methods=['POST'])
 def create_folder():
     try:
         token = get_token()
-        if not token: return jsonify({'error': 'No token'}), 401
         data = request.json
+
         service = get_drive_service(token)
         folder = service.files().create(
-            body={'name': data.get('name', 'Nueva Carpeta'),
-                  'mimeType': 'application/vnd.google-apps.folder',
-                  'parents': [data.get('parent_id', 'root')]},
-            fields='id,name'
+            body={
+                'name': data.get('name'),
+                'mimeType': 'application/vnd.google-apps.folder'
+            }
         ).execute()
-        return jsonify({'success': True, 'folder': folder})
+
+        return jsonify(folder)
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# 📤 SUBIR ARCHIVO
+@app.route('/drive/upload', methods=['POST'])
+def upload_file():
+    try:
+        token = get_token()
+
+        file = request.files['file']
+        temp_path = os.path.join(tempfile.gettempdir(), file.filename)
+        file.save(temp_path)
+
+        service = get_drive_service(token)
+
+        media = MediaFileUpload(temp_path)
+        uploaded = service.files().create(
+            body={'name': file.filename},
+            media_body=media
+        ).execute()
+
+        os.remove(temp_path)
+
+        return jsonify(uploaded)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 🔍 BUSCAR
+@app.route('/drive/search')
+def search():
+    try:
+        token = get_token()
+        q = request.args.get('q')
+
+        service = get_drive_service(token)
+        results = service.files().list(
+            q=f"name contains '{q}'",
+            fields="files(id,name)"
+        ).execute()
+
+        return jsonify(results)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 👁️ PREVIEW (GOD MODE)
+@app.route('/drive/preview')
+def preview():
+    try:
+        file_id = request.args.get('file_id')
+        return jsonify({
+            'preview': f"https://drive.google.com/file/d/{file_id}/preview",
+            'download': f"https://drive.google.com/uc?id={file_id}&export=download"
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# 🧠 INFO ARCHIVO
+@app.route('/drive/info')
+def file_info():
+    try:
+        token = get_token()
+        file_id = request.args.get('file_id')
+
+        service = get_drive_service(token)
+        file = service.files().get(fileId=file_id).execute()
+
+        return jsonify(file)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ❌ ELIMINAR
+@app.route('/drive/delete', methods=['POST'])
+def delete():
+    try:
+        token = get_token()
+        file_id = request.json.get('file_id')
+
+        service = get_drive_service(token)
+        service.files().delete(fileId=file_id).execute()
+
+        return jsonify({'deleted': True})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ───────── RUN ─────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"\n⚡ NEXUS Backend v3.2 en puerto {port}")
-    print(f"🤖 Groq: {'✅' if GROQ_API_KEY else '❌ falta GROQ_API_KEY'}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print(f"⚡ NEXUS GOD MODE en {port}")
+    app.run(host='0.0.0.0', port=port)
