@@ -1,0 +1,6 @@
+token.pickle
+__pycache__/
+*.pyc
+.env
+credentials.json
+nexus_billing.sqlite3
